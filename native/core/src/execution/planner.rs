@@ -110,6 +110,7 @@ use datafusion_comet_spark_expr::{
     SparkCastOptions, StartsWith, Stddev, StringSpaceExpr, SubstringExpr, SumDecimal,
     TimestampTruncExpr, ToJson, UnboundColumn, Variance,
 };
+use datafusion_spark::function::hash::sha2::SparkSha2;
 use datafusion_spark::function::math::expm1::SparkExpm1;
 use itertools::Itertools;
 use jni::objects::GlobalRef;
@@ -158,6 +159,7 @@ impl PhysicalPlanner {
         session_ctx.register_udf(ScalarUDF::new_from_impl(SparkExpm1::default()));
         session_ctx.register_udf(ScalarUDF::new_from_impl(SparkBitwiseNot::default()));
         session_ctx.register_udf(ScalarUDF::new_from_impl(SparkBitwiseCount::default()));
+        session_ctx.register_udf(ScalarUDF::new_from_impl(SparkSha2::default()));
         Self {
             exec_context_id: TEST_EXEC_CONTEXT_ID,
             session_ctx,
@@ -1075,8 +1077,13 @@ impl PhysicalPlanner {
                 let child_copied = Self::wrap_in_copy_exec(Arc::clone(&child.native_plan));
 
                 let sort = Arc::new(
-                    SortExec::new(LexOrdering::new(exprs?), Arc::clone(&child_copied))
-                        .with_fetch(fetch),
+                    SortExec::new(
+                        LexOrdering::new(exprs?).ok_or_else(|| {
+                            GeneralError("Failed to create LexOrdering".to_string())
+                        })?,
+                        Arc::clone(&child_copied),
+                    )
+                    .with_fetch(fetch),
                 );
 
                 Ok((
@@ -2127,7 +2134,7 @@ impl PhysicalPlanner {
             window_func_name,
             &window_args,
             partition_by,
-            &LexOrdering::new(sort_exprs.to_vec()),
+            &sort_exprs,
             window_frame.into(),
             input_schema.as_ref(),
             false, // TODO: Ignore nulls
