@@ -1835,23 +1835,13 @@ object QueryPlanSerde extends Logging with CometExprShim {
           withInfo(expr, "non literal numBits is not supported")
           return None
         }
-        // it's possible for spark to dynamically compute the number of bits from input
-        // expression, however DataFusion does not support that yet.
+
         val childExpr = exprToProtoInternal(left, inputs, binding)
-        val bits = numBits.eval().asInstanceOf[Int]
-        val algorithm = bits match {
-          case 224 => "sha224"
-          case 256 | 0 => "sha256"
-          case 384 => "sha384"
-          case 512 => "sha512"
-          case _ =>
-            null
-        }
-        if (algorithm == null) {
-          exprToProtoInternal(Literal(null, StringType), inputs, binding)
-        } else {
-          scalarFunctionExprToProtoWithReturnType(algorithm, StringType, childExpr)
-        }
+        val bitsExpr = exprToProtoInternal(numBits, inputs, binding)
+
+        val optExpr =
+          scalarFunctionExprToProtoWithReturnType("sha2", StringType, childExpr, bitsExpr)
+        optExprWithInfo(optExpr, expr, left, numBits)
 
       case struct @ CreateNamedStruct(_) =>
         if (struct.names.length != struct.names.distinct.length) {
