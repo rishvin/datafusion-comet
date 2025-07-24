@@ -2854,4 +2854,24 @@ class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
+  test("map_sort") {
+    assume(isSpark40Plus, "map_sort is only supported in Spark 4.0+")
+      // Create test data with map columns having same elements but different order
+      val df = Seq(
+        Map("a" -> 1, "b" -> 2),
+        Map("b" -> 2, "a" -> 1),
+        Map("a" -> 1, "b" -> 3),
+        Map("a" -> 2, "b" -> 4)
+      ).toDF("map_col")
+      
+      df.createOrReplaceTempView("test_table")
+      
+      val query = """
+        SELECT map_col as sorted_map, count(*) as total
+        FROM test_table
+        GROUP BY map_col
+      """
+      checkSparkAnswerAndOperator(query)
+  }
+
 }
