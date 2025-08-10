@@ -31,6 +31,7 @@ import org.apache.spark.sql.functions.{avg, count_distinct, sum}
 import org.apache.spark.sql.internal.SQLConf
 
 import org.apache.comet.CometConf
+import org.apache.comet.CometSparkSessionExtensions.isSpark40Plus
 import org.apache.comet.testing.{DataGenOptions, ParquetGenerator}
 
 /**
@@ -1513,6 +1514,38 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
   def getNumCometHashAggregate(df: DataFrame): Int = {
     val sparkPlan = stripAQEPlan(df.queryExecution.executedPlan)
     sparkPlan.collect { case s: CometHashAggregateExec => s }.size
+  }
+
+  test("groupby with map column") {
+    assume(isSpark40Plus, "Groupby on map type is supported in Spark 4.0 and beyond")
+    //    withSQLConf(
+    //      CometConf.COMET_ENABLED.key -> "false",
+    //      CometConf.COMET_EXEC_ENABLED.key -> "false",
+    //      CometConf.COMET_EXPLAIN_FALLBACK_ENABLED.key -> "false",
+    //      CometConf.COMET_NATIVE_SCAN_IMPL.key -> CometConf.SCAN_NATIVE_DATAFUSION
+    //      //  CometConf.COMET_SHUFFLE_MODE.key -> "native"
+    //    )
+    //    {
+    withParquetTable(
+      Seq(
+        (1, Map("a" -> 1, "b" -> 2)),
+        (2, Map("b" -> 2, "a" -> 1)),
+        (3, Map("a" -> 5, "b" -> 6))),
+      "tbl") {
+      withSQLConf(
+        CometConf.COMET_ENABLED.key -> "true",
+        CometConf.COMET_EXEC_ENABLED.key -> "true",
+        CometConf.COMET_EXPLAIN_FALLBACK_ENABLED.key -> "true",
+        CometConf.COMET_SHUFFLE_MODE.key -> "auto",
+        CometConf.COMET_NATIVE_SCAN_IMPL.key -> CometConf.SCAN_NATIVE_DATAFUSION) {
+        val query = sql("SELECT count(*) AS testing FROM tbl group by _2")
+        println(query.queryExecution.executedPlan)
+        query.show()
+        // checkSparkAnswer(query)
+      }
+      // checkSparkAnswerAndOperator("SELECT _1, SUM(_2['b']) FROM tbl GROUP BY _1")
+    }
+    //   }
   }
 
 }

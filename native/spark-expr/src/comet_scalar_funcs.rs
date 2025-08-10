@@ -34,6 +34,7 @@ use datafusion::physical_plan::ColumnarValue;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
+use crate::map_funcs::spark_map_sort;
 
 macro_rules! make_comet_scalar_udf {
     ($name:expr, $func:ident, $data_type:ident) => {{
@@ -143,6 +144,10 @@ pub fn create_comet_physical_fun(
             let func = Arc::new(spark_modulo);
             let fail_on_error = fail_on_error.unwrap_or(false);
             make_comet_scalar_udf!("spark_modulo", func, without data_type, fail_on_error)
+        }
+        "map_sort" => {
+            let func = Arc::new(spark_map_sort);
+            make_comet_scalar_udf!("spark_map_sort", func, without data_type)
         }
         _ => registry.udf(fun_name).map_err(|e| {
             DataFusionError::Execution(format!(
