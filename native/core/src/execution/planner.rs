@@ -2644,10 +2644,10 @@ fn create_case_expr(
 
 #[cfg(test)]
 mod tests {
-    use futures::{poll, StreamExt};
-    use std::{sync::Arc, task::Poll};
-
-    use arrow::array::{Array, DictionaryArray, Int32Array, RecordBatch, StringArray};
+    use crate::execution::{operators::InputBatch, planner::PhysicalPlanner};
+    use arrow::array::{
+        Array, DictionaryArray, Int32Array, Int32Builder, RecordBatch, StringArray,
+    };
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use datafusion::catalog::memory::DataSourceExec;
     use datafusion::datasource::listing::PartitionedFile;
@@ -2656,17 +2656,24 @@ mod tests {
         FileGroup, FileScanConfigBuilder, FileSource, ParquetSource,
     };
     use datafusion::error::DataFusionError;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::logical_expr::ScalarUDF;
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::SessionConfig;
     use datafusion::{assert_batches_eq, physical_plan::common::collect, prelude::SessionContext};
+    use futures::{poll, StreamExt};
+    use std::hash::Hasher;
+    use std::time::{Duration, Instant};
+    use std::{sync::Arc, task::Poll};
     use tempfile::TempDir;
+    use tokio::runtime::Runtime;
     use tokio::sync::mpsc;
-
-    use crate::execution::{operators::InputBatch, planner::PhysicalPlanner};
+    use tokio::time::timeout;
 
     use crate::execution::operators::ExecutionError;
     use crate::parquet::parquet_support::SparkParquetOptions;
     use crate::parquet::schema_adapter::SparkSchemaAdapterFactory;
+    use datafusion_comet_proto::spark_expression::data_type::{ListInfo, StructInfo};
     use datafusion_comet_proto::spark_expression::expr::ExprStruct;
     use datafusion_comet_proto::{
         spark_expression::expr::ExprStruct::*,
@@ -3447,5 +3454,295 @@ mod tests {
         ];
         assert_batches_eq!(expected, &[actual]);
         Ok(())
+    }
+
+    #[test]
+    fn test_map_grouping_aggregation_using_spark_plan() {
+        use arrow::array::{Int64Builder, StringBuilder};
+        use arrow::datatypes::{Field, Schema};
+        use datafusion::prelude::SessionContext;
+        use datafusion_comet_proto::spark_expression::{
+            agg_expr::ExprStruct as AggExprStruct,
+            data_type::{DataTypeInfo, MapInfo},
+            expr::ExprStruct,
+            literal::Value,
+            AggExpr, BoundReference, Count, DataType as SparkDataType, Expr, Literal,
+        };
+        use datafusion_comet_proto::spark_operator::{
+            operator::OpStruct, AggregateMode, HashAggregate, Operator,
+        };
+        use std::sync::Arc;
+        eprintln!("Testing Map grouping support using Spark plan...");
+
+        // Create map array using Arrow's MapBuilder
+        let string_builder = StringBuilder::new();
+        let int_builder = Int64Builder::new();
+        let mut map_builder = arrow::array::MapBuilder::new(None, string_builder, int_builder);
+
+        // Add some map entries to test grouping:
+        // Row 0: {"a": 1, b: 2}
+        map_builder.keys().append_value("a");
+        map_builder.values().append_value(1);
+        map_builder.keys().append_value("b");
+        map_builder.values().append_value(2);
+        map_builder.append(true).unwrap();
+
+        // Row 1: {"b": 2, a: 1}
+        map_builder.keys().append_value("a");
+        map_builder.values().append_value(1);
+        map_builder.keys().append_value("b");
+        map_builder.values().append_value(2);
+        map_builder.append(true).unwrap();
+
+        // Row 2: {"a": 1} - same as row 0, should group together
+        map_builder.keys().append_value("a");
+        map_builder.values().append_value(1);
+        map_builder.append(true).unwrap();
+
+        // Row 3: {"c": 3}
+        map_builder.keys().append_value("c");
+        map_builder.values().append_value(3);
+        map_builder.append(true).unwrap();
+
+        let map_array = map_builder.finish();
+
+        // Create schema - need a scan operator first
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "map_col",
+            map_array.data_type().clone(),
+            false,
+        )]));
+
+        // Create Spark protobuf structures for HashAgg
+        let map_type = SparkDataType {
+            type_id: 15, // MAP type ID (correct enum value)
+            type_info: Some(Box::new(DataTypeInfo {
+                datatype_struct: Some(
+                    spark_expression::data_type::data_type_info::DatatypeStruct::Map(Box::new(
+                        MapInfo {
+                            key_type: Some(Box::new(SparkDataType {
+                                type_id: 7, // STRING type ID (correct enum value)
+                                type_info: None,
+                            })),
+                            value_type: Some(Box::new(SparkDataType {
+                                type_id: 3, // INT32 type ID (correct enum value)
+                                type_info: None,
+                            })),
+                            value_contains_null: true,
+                        },
+                    )),
+                ),
+            })),
+        };
+
+        let key_dt = SparkDataType {
+            type_id: 7, // STRING in your enum
+            type_info: None,
+        };
+        let value_dt = SparkDataType {
+            type_id: 4, // INT64 in your enum
+            type_info: None,
+        };
+        let value_contains_null: bool = true; // from MapInfo.value_contains_null
+
+        // 1) Struct<key, value>
+        let entries_struct = SparkDataType {
+            type_id: 16, // STRUCT
+            type_info: Some(Box::new(DataTypeInfo {
+                datatype_struct: Some(
+                    spark_expression::data_type::data_type_info::DatatypeStruct::Struct(
+                        StructInfo {
+                            field_names: vec!["keys".to_string(), "values".to_string()],
+                            field_datatypes: vec![
+                                key_dt.clone(),   // key type K
+                                value_dt.clone(), // value type V
+                            ],
+                            field_nullable: vec![
+                                false,               // key is non-null (Arrow/Spark rule)
+                                value_contains_null, // value nullability copied from Map
+                            ],
+                        },
+                    ),
+                ),
+            })),
+        };
+
+        // 2) Array<List> around the entries struct: contains_null = false
+        let list_of_entries = SparkDataType {
+            type_id: 14, // ARRAY
+            type_info: Some(Box::new(DataTypeInfo {
+                datatype_struct: Some(
+                    spark_expression::data_type::data_type_info::DatatypeStruct::List(Box::new(
+                        ListInfo {
+                            element_type: Some(Box::new(entries_struct)),
+                            contains_null: false, // entries are never null
+                        },
+                    )),
+                ),
+            })),
+        };
+
+        // Create BoundReference for map column (index 0)
+        let bound_ref = Expr {
+            expr_struct: Some(Bound(BoundReference {
+                index: 0,
+                datatype: Some(map_type.clone()),
+            })),
+        };
+
+        // Create Count aggregation expression
+        let count_agg = AggExpr {
+            expr_struct: Some(AggExprStruct::Count(Count {
+                children: vec![Expr {
+                    expr_struct: Some(ExprStruct::Literal(Literal {
+                        datatype: Some(SparkDataType {
+                            type_id: 3, // INT32 type ID
+                            type_info: None,
+                        }),
+                        is_null: false,
+                        value: Some(Value::IntVal(1)),
+                    })),
+                }],
+            })),
+        };
+
+        let map_sort_expr = Expr {
+            expr_struct: Some(ScalarFunc(spark_expression::ScalarFunc {
+                func: "map_sort".to_string(),
+                args: vec![bound_ref],
+                return_type: Some(map_type.clone()),
+            })),
+        };
+
+        let map_canonicalize_expr = Expr {
+            expr_struct: Some(ScalarFunc(spark_expression::ScalarFunc {
+                func: "map_canonicalize".to_string(),
+                args: vec![map_sort_expr],
+                return_type: Some(list_of_entries.clone()),
+            })),
+        };
+
+        println!("Map canonicalize expression: {:?}", map_canonicalize_expr);
+
+        // Create HashAggregate protobuf structure
+        let hash_agg = HashAggregate {
+            grouping_exprs: vec![map_canonicalize_expr],
+            agg_exprs: vec![count_agg],
+            result_exprs: vec![],
+            mode: AggregateMode::Partial as i32,
+        };
+
+        // Create a Scan child operator
+        let child_op = Operator {
+            plan_id: 1,
+            op_struct: Some(OpStruct::Scan(spark_operator::Scan {
+                fields: vec![map_type],
+                source: "test_scan".to_string(),
+            })),
+            children: vec![],
+        };
+
+        // Create the HashAgg operator
+        let hash_agg_op = Operator {
+            plan_id: 2,
+            op_struct: Some(OpStruct::HashAgg(hash_agg)),
+            children: vec![child_op],
+        };
+
+        // Build context / planner
+        let ctx = Arc::new(SessionContext::new());
+        let planner = PhysicalPlanner::new(ctx.clone(), 0);
+
+        // Create plan
+        let mut inputs = Vec::new();
+        let (mut scans, exec_plan) = planner.create_plan(&hash_agg_op, &mut inputs, 1).unwrap();
+
+        // Build input batch and set on scan
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(map_array)]).unwrap();
+        if let Some(scan) = scans.get_mut(0) {
+            use crate::execution::operators::InputBatch;
+            let columns: Vec<Arc<dyn Array>> = batch.columns().iter().cloned().collect();
+            let input_batch = InputBatch::new(columns, Some(batch.num_rows()));
+            scan.set_input_batch(input_batch);
+        }
+
+        // Execute plan
+        let task_ctx = ctx.task_ctx();
+        let mut stream = exec_plan.native_plan.execute(0, task_ctx).unwrap();
+
+        // Create a runtime to drive non-blocking polls and draining
+        let runtime = Runtime::new().unwrap();
+
+        // Force one poll to consume the data batch from ScanStream
+        runtime.block_on(async {
+            let _ = poll!(stream.next());
+        });
+
+        // Signal EOF to finalize aggregation
+        if let Some(scan) = scans.get_mut(0) {
+            use crate::execution::operators::InputBatch;
+            scan.set_input_batch(InputBatch::EOF);
+        }
+
+        // Drain stream to completion and collect results
+        let result_batches = runtime.block_on(async move {
+            let mut collected = Vec::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(batch) => {
+                        println!("Received batch: {:?}", batch);
+                        collected.push(batch);
+                    }
+                    Err(e) => panic!("stream error: {e:?}"),
+                }
+            }
+            collected
+        });
+
+        assert!(
+            !result_batches.is_empty(),
+            "Should have at least one result batch"
+        );
+
+        // Verify expected groups and counts directly
+        use arrow::array::{Int64Array, ListArray, StringArray, StructArray};
+        use std::collections::HashMap;
+
+        // Build actual map: "k=v,k=v" -> count
+        let mut actual: HashMap<String, i64> = HashMap::new();
+        for rb in &result_batches {
+            let groups = rb.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+            let counts = rb.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+
+            for row in 0..rb.num_rows() {
+                // Extract key/value pairs for this group and canonicalize
+                let sub = groups.value(row);
+                let sa = sub.as_any().downcast_ref::<StructArray>().unwrap();
+                let keys = sa.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                let vals = sa.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+
+                let mut pairs: Vec<(String, i64)> = (0..sa.len())
+                    .filter(|&i| sa.is_valid(i))
+                    .map(|i| (keys.value(i).to_string(), vals.value(i)))
+                    .collect();
+                pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                let key = pairs
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+
+                let cnt = counts.value(row);
+                actual.insert(key, cnt);
+            }
+        }
+
+        // Expected groups
+        let mut expected: HashMap<String, i64> = HashMap::new();
+        expected.insert("a=1,b=2".to_string(), 2);
+        expected.insert("a=1".to_string(), 1);
+        expected.insert("c=3".to_string(), 1);
+
+        assert_eq!(actual, expected);
     }
 }
