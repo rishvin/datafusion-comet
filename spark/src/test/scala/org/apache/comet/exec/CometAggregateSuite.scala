@@ -20,16 +20,14 @@
 package org.apache.comet.exec
 
 import scala.util.Random
-
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{CometTestBase, DataFrame, Row}
 import org.apache.spark.sql.catalyst.optimizer.EliminateSorts
 import org.apache.spark.sql.comet.CometHashAggregateExec
 import org.apache.spark.sql.comet.execution.shuffle.CometShuffleExchangeExec
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
-import org.apache.spark.sql.functions.{avg, count_distinct, sum}
+import org.apache.spark.sql.functions.{avg, count_distinct, rand, sum}
 import org.apache.spark.sql.internal.SQLConf
-
 import org.apache.comet.CometConf
 import org.apache.comet.testing.{DataGenOptions, ParquetGenerator}
 
@@ -1485,6 +1483,29 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
             }
           }
         }
+      }
+    }
+  }
+
+  test("Sort aggregation") {
+    withSQLConf(
+      CometConf.COMET_ENABLED.key -> "true",
+      CometConf.COMET_EXEC_ENABLED.key -> "true",
+      CometConf.COMET_EXPLAIN_FALLBACK_ENABLED.key -> "true",
+      "spark.sql.execution.useObjectHashAggregateExec" -> "false",
+      "spark.sql.test.forceApplySortAggregate"-> "true",
+      "spark.sql.test.forceApplyObjectHashAggregate"-> "false") {
+      val N = 150
+      val src = spark.range(N).withColumn("x", (rand(100) * N).cast("long"))
+
+      withParquetTable(src, "tbl") {
+        val df = sql("select * from tbl")
+        //"select x % 100 as g, last(x), first(x), max(x), min(x) from tbl group by g"
+        //checkSparkAnswer("select * from tbl")
+        checkSparkAnswer("select x % 100 as key, max(x) as value from tbl group by key order by key, value")
+        df.show(N)
+       // val df = sql("select x % 100 as g, last(x), first(x), max(x), min(x) from tbl group by g")
+        //df.explain(true)
       }
     }
   }

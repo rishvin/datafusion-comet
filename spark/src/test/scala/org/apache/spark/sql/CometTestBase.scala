@@ -161,6 +161,10 @@ abstract class CometTestBase
       sparkPlan = dfSpark.queryExecution.executedPlan
     }
     val dfComet = datasetOfRows(spark, df.logicalPlan)
+    println("------------------------------------------------")
+    println("Spark Plan:\n" + sparkPlan.treeString)
+    println("Comet Plan:\n" + dfComet.queryExecution.executedPlan.treeString)
+    println("------------------------------------------------")
     checkAnswer(dfComet, expected)
     (sparkPlan, dfComet.queryExecution.executedPlan)
   }

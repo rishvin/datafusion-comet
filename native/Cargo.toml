@@ -38,8 +38,8 @@ arrow = { version = "56.0.0", features = ["prettyprint", "ffi", "chrono-tz"] }
 async-trait = { version = "0.1" }
 bytes = { version = "1.10.0" }
 parquet = { version = "=56.0.0", default-features = false, features = ["experimental"] }
-datafusion = { version = "50.0.0", default-features = false, features = ["unicode_expressions", "crypto_expressions", "nested_expressions", "parquet"] }
-datafusion-spark = { version = "50.0.0" }
+datafusion = { path = "/home/rishabjoshi/Projects/datafusion/datafusion/core", default-features = false, features = ["unicode_expressions", "crypto_expressions", "nested_expressions", "parquet"] }
+datafusion-spark = { path = "/home/rishabjoshi/Projects/datafusion/datafusion/spark" }
 datafusion-comet-spark-expr = { path = "spark-expr" }
 datafusion-comet-proto = { path = "proto" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -60,3 +60,4 @@ overflow-checks = false
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+

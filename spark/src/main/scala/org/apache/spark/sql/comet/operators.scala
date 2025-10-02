@@ -744,6 +744,57 @@ case class CometHashAggregateExec(
   override protected def outputExpressions: Seq[NamedExpression] = resultExpressions
 }
 
+case class CometSortAggregateExec(
+    override val nativeOp: Operator,
+    override val originalPlan: SparkPlan,
+    override val output: Seq[Attribute],
+    groupingExpressions: Seq[NamedExpression],
+    aggregateExpressions: Seq[AggregateExpression],
+    resultExpressions: Seq[NamedExpression],
+    input: Seq[Attribute],
+    mode: Option[AggregateMode],
+    child: SparkPlan,
+    override val serializedPlanOpt: SerializedPlan)
+    extends CometUnaryExec
+    with PartitioningPreservingUnaryExecNode {
+  override def producedAttributes: AttributeSet = outputSet ++ AttributeSet(resultExpressions)
+
+  override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
+    this.copy(child = newChild)
+
+  override def verboseStringWithOperatorId(): String = {
+    s"""
+       |$formattedNodeName
+       |${ExplainUtils.generateFieldString("Input", child.output)}
+       |${ExplainUtils.generateFieldString("Keys", groupingExpressions)}
+       |${ExplainUtils.generateFieldString("Functions", aggregateExpressions)}
+       |""".stripMargin
+  }
+
+  override def stringArgs: Iterator[Any] =
+    Iterator(input, mode, groupingExpressions, aggregateExpressions, child)
+
+  override def equals(obj: Any): Boolean = {
+    obj match {
+      case other: CometSortAggregateExec =>
+        this.output == other.output &&
+        this.groupingExpressions == other.groupingExpressions &&
+        this.aggregateExpressions == other.aggregateExpressions &&
+        this.input == other.input &&
+        this.mode == other.mode &&
+        this.child == other.child &&
+        this.serializedPlanOpt == other.serializedPlanOpt
+      case _ =>
+        false
+    }
+  }
+
+  override def hashCode(): Int =
+    Objects.hashCode(output, groupingExpressions, aggregateExpressions, input, mode, child)
+
+  override protected def outputExpressions: Seq[NamedExpression] = resultExpressions
+}
+
 case class CometHashJoinExec(
     override val nativeOp: Operator,
     override val originalPlan: SparkPlan,

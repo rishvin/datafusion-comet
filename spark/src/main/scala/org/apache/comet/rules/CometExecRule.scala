@@ -31,7 +31,7 @@ import org.apache.spark.sql.comet._
 import org.apache.spark.sql.comet.execution.shuffle.{CometColumnarShuffle, CometNativeShuffle, CometShuffleExchangeExec, CometShuffleManager}
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AQEShuffleReadExec, BroadcastQueryStageExec, ShuffleQueryStageExec}
-import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec, ObjectHashAggregateExec}
+import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec, ObjectHashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.execution.command.ExecutedCommandExec
 import org.apache.spark.sql.execution.datasources.v2.V2CommandExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExchangeExec, ShuffleExchangeExec}
@@ -234,10 +234,11 @@ case class CometExecRule(session: SparkSession) extends Rule[SparkPlan] {
       // When Comet shuffle is disabled, we don't want to transform the HashAggregate
       // to CometHashAggregate. Otherwise, we probably get partial Comet aggregation
       // and final Spark aggregation.
+      // Extend support to SortAggregateExec as well.
       case op: BaseAggregateExec
-          if op.isInstanceOf[HashAggregateExec] ||
-            op.isInstanceOf[ObjectHashAggregateExec] &&
-            isCometShuffleEnabled(conf) =>
+          if (op.isInstanceOf[HashAggregateExec] ||
+            op.isInstanceOf[ObjectHashAggregateExec] ||
+            op.isInstanceOf[SortAggregateExec]) && isCometShuffleEnabled(conf) =>
         val modes = op.aggregateExpressions.map(_.mode).distinct
         // In distinct aggregates there can be a combination of modes
         val multiMode = modes.size > 1
@@ -256,17 +257,33 @@ case class CometExecRule(session: SparkSession) extends Rule[SparkPlan] {
               // modes is empty too. If aggExprs is not empty, we need to verify all the
               // aggregates have the same mode.
               assert(modes.length == 1 || modes.isEmpty)
-              CometHashAggregateExec(
-                nativeOp,
-                op,
-                op.output,
-                op.groupingExpressions,
-                op.aggregateExpressions,
-                op.resultExpressions,
-                op.child.output,
-                modes.headOption,
-                op.child,
-                SerializedPlan(None))
+
+              op match {
+                case _: HashAggregateExec | _: ObjectHashAggregateExec =>
+                  CometHashAggregateExec(
+                    nativeOp,
+                    op,
+                    op.output,
+                    op.groupingExpressions,
+                    op.aggregateExpressions,
+                    op.resultExpressions,
+                    op.child.output,
+                    modes.headOption,
+                    op.child,
+                    SerializedPlan(None))
+                case _: SortAggregateExec =>
+                  CometSortAggregateExec(
+                    nativeOp,
+                    op,
+                    op.output,
+                    op.groupingExpressions,
+                    op.aggregateExpressions,
+                    op.resultExpressions,
+                    op.child.output,
+                    modes.headOption,
+                    op.child,
+                    SerializedPlan(None))
+              }
             })
         }
 
@@ -724,13 +741,14 @@ case class CometExecRule(session: SparkSession) extends Rule[SparkPlan] {
    * Find the first Comet partial aggregate in the plan. If it reaches a Spark HashAggregate with
    * partial mode, it will return None.
    */
-  private def findCometPartialAgg(plan: SparkPlan): Option[CometHashAggregateExec] = {
+  private def findCometPartialAgg(plan: SparkPlan): Option[SparkPlan] = {
     plan.collectFirst {
       case agg: CometHashAggregateExec if agg.aggregateExpressions.forall(_.mode == Partial) =>
         Some(agg)
       case agg: HashAggregateExec if agg.aggregateExpressions.forall(_.mode == Partial) => None
       case agg: ObjectHashAggregateExec if agg.aggregateExpressions.forall(_.mode == Partial) =>
         None
+      case agg: SortAggregateExec if agg.aggregateExpressions.forall(_.mode == Partial) => None
       case a: AQEShuffleReadExec => findCometPartialAgg(a.child)
       case s: ShuffleQueryStageExec => findCometPartialAgg(s.plan)
     }.flatten

@@ -1187,6 +1187,86 @@ impl PhysicalPlanner {
                     ))
                 }
             }
+            OpStruct::SortAgg(agg) => {
+                println!("------- Executing sort aggregation ----------");
+                assert_eq!(children.len(), 1);
+                let (scans, child) = self.create_plan(&children[0], inputs, partition_count)?;
+
+                let group_exprs: PhyExprResult = agg
+                    .grouping_exprs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, expr)| {
+                        self.create_expr(expr, child.schema())
+                            .map(|r| (r, format!("col_{idx}")))
+                    })
+                    .collect();
+                let group_by = PhysicalGroupBy::new_single(group_exprs?);
+                let schema = child.schema();
+
+                let mode = if agg.mode == 0 {
+                    DFAggregateMode::Partial
+                } else {
+                    DFAggregateMode::Final
+                };
+
+                let agg_exprs: PhyAggResult = agg
+                    .agg_exprs
+                    .iter()
+                    .map(|expr| self.create_agg_expr(expr, Arc::clone(&schema)))
+                    .collect();
+
+                let num_agg = agg.agg_exprs.len();
+                let aggr_expr = agg_exprs?.into_iter().map(Arc::new).collect();
+                let aggregate: Arc<dyn ExecutionPlan> = Arc::new(
+                    datafusion::physical_plan::aggregates::AggregateExec::try_new(
+                        mode,
+                        group_by,
+                        aggr_expr,
+                        vec![None; num_agg], // no filter expressions
+                        Arc::clone(&child.native_plan),
+                        Arc::clone(&schema),
+                    )?,
+                );
+                let result_exprs: PhyExprResult = agg
+                    .result_exprs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, expr)| {
+                        self.create_expr(expr, aggregate.schema())
+                            .map(|r| (r, format!("col_{idx}")))
+                    })
+                    .collect();
+
+                if agg.result_exprs.is_empty() {
+                    Ok((
+                        scans,
+                        Arc::new(SparkPlan::new(spark_plan.plan_id, aggregate, vec![child])),
+                    ))
+                } else {
+                    // For final aggregation, DF's hash aggregate exec doesn't support Spark's
+                    // aggregate result expressions like `COUNT(col) + 1`, but instead relying
+                    // on additional `ProjectionExec` to handle the case. Therefore, here we'll
+                    // add a projection node on top of the aggregate node.
+                    //
+                    // Note that `result_exprs` should only be set for final aggregation on the
+                    // Spark side.
+                    let projection = Arc::new(ProjectionExec::try_new(
+                        result_exprs?,
+                        Arc::clone(&aggregate),
+                    )?);
+                    Ok((
+                        scans,
+                        Arc::new(SparkPlan::new_with_additional(
+                            spark_plan.plan_id,
+                            projection,
+                            vec![child],
+                            vec![aggregate],
+                        )),
+                    ))
+                }
+            },
+
             OpStruct::Limit(limit) => {
                 assert_eq!(children.len(), 1);
                 let num = limit.limit;

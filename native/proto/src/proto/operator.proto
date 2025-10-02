@@ -41,6 +41,8 @@ message Operator {
     Filter filter = 102;
     Sort sort = 103;
     HashAggregate hash_agg = 104;
+    // Sort-based aggregate
+    SortAggregate sort_agg = 112;
     Limit limit = 105;
     ShuffleWriter shuffle_writer = 106;
     Expand expand = 107;
@@ -123,6 +125,13 @@ message Sort {
 }
 
 message HashAggregate {
+  repeated spark.spark_expression.Expr grouping_exprs = 1;
+  repeated spark.spark_expression.AggExpr agg_exprs = 2;
+  repeated spark.spark_expression.Expr result_exprs = 3;
+  AggregateMode mode = 5;
+}
+
+message SortAggregate {
   repeated spark.spark_expression.Expr grouping_exprs = 1;
   repeated spark.spark_expression.AggExpr agg_exprs = 2;
   repeated spark.spark_expression.Expr result_exprs = 3;
